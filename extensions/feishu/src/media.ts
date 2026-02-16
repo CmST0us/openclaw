@@ -320,8 +320,8 @@ export async function sendFileFeishu(params: {
   cfg: ClawdbotConfig;
   to: string;
   fileKey: string;
-  /** Use "media" for audio/video files, "file" for documents */
-  msgType?: "file" | "media";
+  /** Use "media" for audio/video files, "file" for documents, "audio" for voice messages */
+  msgType?: "file" | "media" | "audio";
   replyToMessageId?: string;
   accountId?: string;
 }): Promise<SendMediaResult> {
@@ -389,6 +389,10 @@ export function detectFileType(
   switch (ext) {
     case ".opus":
     case ".ogg":
+    case ".mp3":
+    case ".wav":
+    case ".m4a":
+    case ".aac":
       return "opus";
     case ".mp4":
     case ".mov":
@@ -407,6 +411,35 @@ export function detectFileType(
       return "ppt";
     default:
       return "stream";
+  }
+}
+
+/**
+ * Get audio/video file duration in milliseconds using ffprobe
+ */
+export async function getMediaDuration(filePath: string): Promise<number | undefined> {
+  try {
+    const { execFile } = await import("child_process");
+    const { promisify } = await import("util");
+    const execFileAsync = promisify(execFile);
+
+    const { stdout } = await execFileAsync("ffprobe", [
+      "-v",
+      "error",
+      "-show_entries",
+      "format=duration",
+      "-of",
+      "default=noprint_wrappers=1:nokey=1",
+      filePath,
+    ]);
+
+    const durationSeconds = parseFloat(stdout.trim());
+    if (!isNaN(durationSeconds)) {
+      return Math.round(durationSeconds * 1000);
+    }
+    return undefined;
+  } catch {
+    return undefined;
   }
 }
 
@@ -431,10 +464,15 @@ export async function sendMediaFeishu(params: {
 
   let buffer: Buffer;
   let name: string;
+  let tempFilePath: string | undefined;
 
   if (mediaBuffer) {
     buffer = mediaBuffer;
     name = fileName ?? "file";
+    // Save buffer to temp file to get duration
+    const os = await import("os");
+    tempFilePath = path.join(os.tmpdir(), `feishu_media_${Date.now()}_${name}`);
+    await fs.promises.writeFile(tempFilePath, buffer);
   } else if (mediaUrl) {
     const loaded = await getFeishuRuntime().media.loadWebMedia(mediaUrl, {
       maxBytes: mediaMaxBytes,
@@ -442,35 +480,55 @@ export async function sendMediaFeishu(params: {
     });
     buffer = loaded.buffer;
     name = fileName ?? loaded.fileName ?? "file";
+    // Save buffer to temp file to get duration
+    const os = await import("os");
+    tempFilePath = path.join(os.tmpdir(), `feishu_media_${Date.now()}_${name}`);
+    await fs.promises.writeFile(tempFilePath, buffer);
   } else {
     throw new Error("Either mediaUrl or mediaBuffer must be provided");
   }
 
-  // Determine if it's an image based on extension
-  const ext = path.extname(name).toLowerCase();
-  const isImage = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico", ".tiff"].includes(ext);
+  try {
+    // Determine if it's an image based on extension
+    const ext = path.extname(name).toLowerCase();
+    const isImage = [".jpg", ".jpeg", ".png", ".gif", ".webp", ".bmp", ".ico", ".tiff"].includes(
+      ext,
+    );
 
-  if (isImage) {
-    const { imageKey } = await uploadImageFeishu({ cfg, image: buffer, accountId });
-    return sendImageFeishu({ cfg, to, imageKey, replyToMessageId, accountId });
-  } else {
-    const fileType = detectFileType(name);
-    const { fileKey } = await uploadFileFeishu({
-      cfg,
-      file: buffer,
-      fileName: name,
-      fileType,
-      accountId,
-    });
-    // Feishu requires msg_type "media" for audio/video, "file" for documents
-    const isMedia = fileType === "mp4" || fileType === "opus";
-    return sendFileFeishu({
-      cfg,
-      to,
-      fileKey,
-      msgType: isMedia ? "media" : "file",
-      replyToMessageId,
-      accountId,
-    });
+    if (isImage) {
+      const { imageKey } = await uploadImageFeishu({ cfg, image: buffer, accountId });
+      return sendImageFeishu({ cfg, to, imageKey, replyToMessageId, accountId });
+    } else {
+      const fileType = detectFileType(name);
+      // Get duration for audio/video files
+      let duration: number | undefined;
+      const isMedia = fileType === "mp4" || fileType === "opus";
+      if (isMedia && tempFilePath) {
+        duration = await getMediaDuration(tempFilePath);
+      }
+
+      const { fileKey } = await uploadFileFeishu({
+        cfg,
+        file: buffer,
+        fileName: name,
+        fileType,
+        duration,
+        accountId,
+      });
+      // Feishu requires msg_type "media" for audio/video, "file" for documents
+      return sendFileFeishu({
+        cfg,
+        to,
+        fileKey,
+        msgType: isMedia ? "media" : "file",
+        replyToMessageId,
+        accountId,
+      });
+    }
+  } finally {
+    // Clean up temp file
+    if (tempFilePath) {
+      await fs.promises.unlink(tempFilePath).catch(() => {});
+    }
   }
 }
